@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=python
+Exec=python
+Comment=A Python {{ python-fullversion }} runtime with custom installed site packages
+Icon=python
+Categories=Development;
+Terminal=true

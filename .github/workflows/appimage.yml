@@ -1,0 +1,30 @@
+name: AppImage
+on: [push, pull_request]
+
+jobs:
+  Generate:
+    runs-on: ubuntu-latest
+    env:
+      LINUX_TAG: manylinux2014
+      PYTHON_VERSION: 3.10
+
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/checkout@v2
+      with:
+        repository: niess/python-appimage
+        path: python-appimage
+
+    - name: Build
+      run: |
+        ln -s python-appimage/python_appimage
+        python -m python_appimage build app -l ${LINUX_TAG}_x86_64 \
+                                            -p ${PYTHON_VERSION} appimage
+
+    - name: Release
+      uses: marvinpinto/action-automatic-releases@latest
+      with:
+        automatic_release_tag: continuous
+        title: Continuous build
+        files: python-x86_64.AppImage
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
