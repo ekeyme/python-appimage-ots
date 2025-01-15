@@ -17,6 +17,9 @@ jobs:
     - name: Install dependencies
       run: |
         pip install python-appimage
+        curl -L -O https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+        mv appimagetool-x86_64.AppImage ~/.local/bin/appimagetool
+        chmod +x ~/.local/bin/appimagetool
 
     - name: Build
       run: |
