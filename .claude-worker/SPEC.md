@@ -1,6 +1,6 @@
 # Claude Code Worker — 设计规格（Design Spec）
 
-**版本**: 0.4  
+**版本**: 0.5  
 **当前实现方案**: 方案 A — Vagrant + libvirt + Ubuntu Cloud Image  
 **目标**: 让用户通过一条命令启动多个隔离的 Claude Code 工作环境，每个环境对应一个 git 分支，在浏览器中与 Claude Code 交互完成任务，结果自动推送到结果分支。
 
@@ -154,6 +154,11 @@ end
 
 ### 2.6 build-box/provision.sh
 
+> ⚠️ 路径说明：Vagrant 的 synced_folder 默认只挂载 `build-box/` 目录为 `/vagrant`，
+> 无法直接访问 `vm/` 下的脚本。解法：`build-box/Vagrantfile` 额外 sync `vm/` 目录，
+> 或在 provision.sh 里用 curl/wget 从本地 HTTP 服务获取，或在打包前手动复制。
+> 最简方案：在 `build-box/Vagrantfile` 中添加 `config.vm.synced_folder "../vm", "/vm-scripts"`。
+
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -180,9 +185,9 @@ ln -sf "$CLAUDE_BIN" /usr/local/bin/claude
 # 验证安装
 claude --version
 
-# 写入 entrypoint 和 push 脚本
-cp /vagrant/../vm/entrypoint.sh /usr/local/bin/entrypoint.sh
-cp /vagrant/../vm/push-and-exit.sh /usr/local/bin/push-and-exit.sh
+# 写入 entrypoint 和 push 脚本（由 build-box/Vagrantfile sync /vm-scripts 挂载）
+cp /vm-scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+cp /vm-scripts/push-and-exit.sh /usr/local/bin/push-and-exit.sh
 chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/push-and-exit.sh
 
 echo "[provision] Golden box 构建完成"
@@ -230,6 +235,14 @@ end
 
 ### 2.8 vm/entrypoint.sh
 
+API Key 三层获取逻辑（优先级：URL > 挂载文件 > 环境变量）：
+- URL 方式：key 只进内存，不落磁盘，最安全
+- 文件挂载：key 通过 rsync 进 VM，存在磁盘，需权限保护
+- 环境变量：兜底，通过 Vagrant `env:` 注入
+
+> ⚠️ 注意：`/etc/environment` 会落磁盘，仅在无更好方案时作为兜底使用。
+> VM 销毁后磁盘随之销毁，风险可控；但在 VM 存活期间 key 可被读取。
+
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -238,12 +251,25 @@ set -euo pipefail
 : "${WORKER_BRANCH:?需要 WORKER_BRANCH}"
 : "${WORKER_PURPOSE:?需要 WORKER_PURPOSE}"
 : "${WORKER_ID:?需要 WORKER_ID}"
-: "${ANTHROPIC_API_KEY:?需要 ANTHROPIC_API_KEY}"
+
+# ── API Key 三层获取（优先级：URL > 挂载文件 > 环境变量）──────
+if [[ -n "${SECRET_URL:-}" ]]; then
+    # 层 1：从 URL 动态获取，key 只进内存
+    ANTHROPIC_API_KEY=$(curl -sf "$SECRET_URL" \
+        -H "Authorization: Bearer ${SECRET_TOKEN:-}" \
+        | grep -o '"api_key":"[^"]*"' | cut -d'"' -f4)
+elif [[ -f "/secrets/anthropic_api_key" ]]; then
+    # 层 2：从挂载文件读取
+    ANTHROPIC_API_KEY=$(cat /secrets/anthropic_api_key)
+else
+    # 层 3：从环境变量（Vagrant env: 注入）
+    : "${ANTHROPIC_API_KEY:?未配置 API Key（需 SECRET_URL、/secrets/anthropic_api_key 或 ANTHROPIC_API_KEY 之一）}"
+fi
+export ANTHROPIC_API_KEY
 
 # 写入全局环境（使 ttyd 启动的子进程也能读取）
-cat >> /etc/environment << EOF
-ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-EOF
+# 仅在环境变量兜底路径下 key 会落磁盘；URL/文件路径 key 只在此进程内存中
+echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> /etc/environment
 
 RESULT_BRANCH="result/${WORKER_PURPOSE}-$(date +%Y%m%d-%H%M%S)"
 TTYD_PORT="${TTYD_PORT:-7681}"
@@ -332,8 +358,8 @@ fi
   claude-code-worker stop <id> [--force]
   claude-code-worker logs <id>
   claude-code-worker status <id>
-  claude-code-worker review --branch <result-branch>   ← AI 审核（起新 worker 对结果分支做 review）
-  claude-code-worker build-box [--force]               ← 构建 golden box（首次必须）
+  claude-code-worker review --repo <url> --branch <result-branch> [--purpose review]
+  claude-code-worker build-box [--force]
 
 # 兼容简写:
   claude-code-worker --repo <url> --branch <branch> --purpose <purpose>
@@ -343,6 +369,13 @@ start 选项:
   --memory         VM 内存（默认 2048，单位 MB）
   --cpus           VM CPU 数（默认 2）
   --no-ssh         不同步 ~/.ssh 进 VM
+  --secret-url     API Key 获取 URL（层 1）
+  --secret-token   SECRET_URL 的 Bearer Token
+
+review 说明:
+  起一个新 worker VM，检出 <result-branch>，claude 阅读变更并生成 review。
+  review 结果存放位置待定（见 2.16 待设计事项）。
+  worker 完成后自动销毁。
 ```
 
 ### 2.11 配置文件
@@ -353,7 +386,8 @@ ANTHROPIC_API_KEY=sk-ant-api03-xxxx
 # GIT_TOKEN=ghp_xxxx   # HTTPS push 时使用
 ```
 
-CLI 启动时自动 `source` 此文件，通过 Vagrantfile `env:` 注入 VM。
+CLI 启动时读取此文件并导出为进程环境变量，通过 Vagrantfile `env:` 注入 VM。
+Ruby 读取的是进程环境（`ENV["KEY"]`），需要 CLI 在调用 `vagrant` 前先 `export`。
 
 ### 2.12 端口规划
 
