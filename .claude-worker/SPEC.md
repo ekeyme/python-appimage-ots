@@ -449,6 +449,11 @@ worker push 前需生成并提交以下产物，具体内容待定：
 **待定问题**：
 - [ ] 用户的 secret server 方案（自建 vs Vault vs 云服务）？
 
+#### Box 更新策略
+采用**方向 A：简单重建**。
+流程：停所有 worker → `claude-code-worker build-box --force` 重建 → 继续使用新 box。
+无版本共存，旧 box 直接替换。适合个人开发工具、worker 生命周期短的场景。
+
 #### install.sh（一次性环境准备）
 用途：让本地机器具备运行 `claude-code-worker` 的条件（类比"装 Docker Engine"）。
 执行顺序：`install.sh` → `build-box` → 日常 `start`。
