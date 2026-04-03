@@ -449,6 +449,20 @@ worker push 前需生成并提交以下产物，具体内容待定：
 **待定问题**：
 - [ ] 用户的 secret server 方案（自建 vs Vault vs 云服务）？
 
+#### install.sh（一次性环境准备）
+用途：让本地机器具备运行 `claude-code-worker` 的条件（类比"装 Docker Engine"）。
+执行顺序：`install.sh` → `build-box` → 日常 `start`。
+
+需要完成：
+1. 检查 KVM 可用性（`kvm-ok`）、libvirt daemon 状态、用户是否在 `libvirt` 组
+2. 安装 `vagrant-libvirt` plugin 及其系统依赖（`libvirt-dev`、`ruby-dev`）
+3. 下载 base box（`vagrant box add generic/ubuntu2404`，几百 MB）
+4. 初始化 `~/.claude-worker/` 目录结构和 `secrets.env` 模板
+5. 将 `claude-code-worker` symlink 到 `/usr/local/bin/`
+
+**待定问题**：
+- [ ] 是否需要 install.sh，还是用户手动处理依赖即可？
+
 ---
 
 ## 3. 方案 B（演进）：Weaveworks Ignite — Firecracker 封装
