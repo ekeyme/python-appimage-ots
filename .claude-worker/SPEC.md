@@ -1,7 +1,7 @@
 # Claude Code Worker — 设计规格（Design Spec）
 
-**版本**: 0.3  
-**当前实现方案**: 方案 B — Vagrant + libvirt + Ubuntu Cloud Image  
+**版本**: 0.4  
+**当前实现方案**: 方案 A — Vagrant + libvirt + Ubuntu Cloud Image  
 **目标**: 让用户通过一条命令启动多个隔离的 Claude Code 工作环境，每个环境对应一个 git 分支，在浏览器中与 Claude Code 交互完成任务，结果自动推送到结果分支。
 
 ---
@@ -332,7 +332,8 @@ fi
   claude-code-worker stop <id> [--force]
   claude-code-worker logs <id>
   claude-code-worker status <id>
-  claude-code-worker build-box [--force]   ← 构建 golden box（首次必须）
+  claude-code-worker review --branch <result-branch>   ← AI 审核（起新 worker 对结果分支做 review）
+  claude-code-worker build-box [--force]               ← 构建 golden box（首次必须）
 
 # 兼容简写:
   claude-code-worker --repo <url> --branch <branch> --purpose <purpose>
@@ -415,6 +416,38 @@ claude-code-worker stop ccw-bug-fixing-20240403120000
       → provision.sh 用 `find` 自动定位并建 symlink，已处理
 - [ ] SSH rsync 到 VM 时权限是否正确？
       → 已在 Vagrantfile 中指定 `--chmod=D700,F600`，实测确认
+
+### 2.16 待设计事项（需用户决策后补充）
+
+#### Worker 产物（VM 销毁前保存）
+worker push 前需生成并提交以下产物，具体内容待定：
+- 代码变更（已有）
+- spec/plan 文档
+- 初步 AI 自我 review 文档
+- 行为测试文档
+- 测试运行结果
+
+**待定问题**：
+- [ ] 产物存放位置：repo 内 `.worker-output/` 目录 vs PR description/comments？
+- [ ] 测试命令如何获取：从 Makefile/package.json 自动推断 vs 启动时 `--test-cmd` 指定？
+
+#### 审核流程
+- 支持人工和 AI 审核，按事项决定
+- `claude-code-worker review --branch result/xxx` 起新 worker 做 AI review
+- VM push 完立即销毁，VM 和 PR 生命周期解耦
+
+**待定问题**：
+- [ ] review worker 的产物如何回写：PR comment vs 新 commit vs 单独文件？
+- [ ] AI review 是否自动触发（push 后立即起 review worker）还是手动调用？
+- [ ] PR 是 worker 自动创建还是人工创建？
+
+#### API Key 获取方式（三选一，优先级顺序）
+1. 请求 URL（动态，不落磁盘）—— `SECRET_URL` + `SECRET_TOKEN`
+2. 挂载目录文件读取 —— `/secrets/anthropic_api_key`
+3. 环境变量兜底 —— `ANTHROPIC_API_KEY`
+
+**待定问题**：
+- [ ] 用户的 secret server 方案（自建 vs Vault vs 云服务）？
 
 ---
 
