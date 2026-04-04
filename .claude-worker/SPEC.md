@@ -1,0 +1,697 @@
+# Claude Code Worker — 设计规格（Design Spec）
+
+**版本**: 0.6  
+**当前实现方案**: 方案 A — Vagrant + libvirt + Ubuntu Cloud Image  
+**目标**: 让用户通过一条命令启动多个隔离的 Claude Code 工作环境，每个环境对应一个 git 分支，在浏览器中与 Claude Code 交互完成任务，结果自动推送到结果分支。
+
+---
+
+## 0. 方案演进路线图
+
+| 方案 | 技术栈 | 启动时间 | 隔离级别 | 状态 |
+|---|---|---|---|---|
+| **A（当前）** | Vagrant + libvirt + Ubuntu Cloud Image | 5–15 秒 | VM（独立内核） | ✅ **当前实现** |
+| B（演进） | Weaveworks Ignite（Firecracker 封装） | ~1 秒 | VM（独立内核） | 📋 待规划 |
+| C（演进） | Kata Containers（Docker CLI + VM 隔离） | 1–2 秒 | VM（独立内核） | 📋 待规划 |
+
+> 三个方案的 `entrypoint.sh`、`push-and-exit.sh`、`claude-code-worker` CLI 接口**完全复用**，
+> 只有底层 VM 启动机制不同。演进时只需替换"启动层"，不需要重写上层逻辑。
+
+---
+
+## 1. 当前 Claude Code Web 环境基线（经实测）
+
+> 此节描述 Anthropic 云端环境，作为构建本地环境的参考基准。
+
+| 项目 | 值 | 路径 |
+|---|---|---|
+| 虚拟化类型 | Firecracker VM（PID 1: /process_api --firecracker-init） | — |
+| 操作系统 | Ubuntu 24.04.4 LTS (Noble Numbat) | — |
+| 内核 | Linux 6.18.5 x86_64 | — |
+| Python | 3.11.15 | `/usr/local/bin/python3` |
+| Node.js | 22.22.2 | `/opt/node22/bin/node` |
+| Go | 1.24.7 | `/usr/local/go/bin/go` |
+| Rust | 1.94.1 | `/usr/bin/rustc` |
+| Java | OpenJDK 21.0.10 | `/usr/bin/java` |
+| Ruby | 3.3.6 | `/usr/bin/ruby` |
+| PHP | 8.4.19 | `/usr/bin/php` |
+| Git | 2.43.0 | `/usr/bin/git` |
+| tmux | 3.4 | `/usr/bin/tmux` |
+| **Claude Code** | **2.1.91** | `/opt/claude-code/bin/claude`（230MB ELF） |
+| CPU | 4 核 / 内存 15 GB / 磁盘 252 GB | — |
+
+### Claude Code 关键参数（v2.1.91 实测）
+
+```
+claude [prompt]                       # 交互式会话
+claude -p / --print                   # 非交互模式
+claude --dangerously-skip-permissions # 跳过权限确认（VM 内安全）
+claude --tmux                         # 在 tmux 会话中运行
+claude --worktree [name]              # 创建 git worktree
+claude --settings <file>              # 自定义设置文件
+```
+
+> ⚠️ `--bare` 在 v2.1.91 中不存在。认证只需设 `ANTHROPIC_API_KEY` 环境变量。
+
+---
+
+## 2. 方案 A：Vagrant + libvirt + Ubuntu Cloud Image（当前实现）
+
+### 2.1 架构总览
+
+```
+用户本地 Linux 机器（有 KVM + vagrant-libvirt）
+│
+├── claude-code-worker CLI
+│   ├── start --repo --branch --purpose
+│   ├── list / stop / logs / status
+│   └── build-box（构建 golden box，首次或更新时用）
+│
+├── ~/.claude-worker/
+│   ├── secrets.env                  ← 敏感信息（chmod 600，不进 git）
+│   ├── workers.json                 ← 运行状态
+│   ├── boxes/
+│   │   └── claude-worker.box        ← golden box（预装所有工具）
+│   └── instances/
+│       ├── ccw-bug-fixing-xxx/
+│       │   ├── Vagrantfile          ← 动态生成，含端口和参数
+│       │   └── .vagrant/
+│       └── ccw-feature-dev-xxx/
+│           └── ...
+│
+└── Vagrant VMs（KVM 隔离）
+    ├── ccw-bug-fixing-xxx  :7700  → http://localhost:7700
+    ├── ccw-feature-dev-xxx :7701  → http://localhost:7701
+    └── ccw-refactor-xxx    :7702  → http://localhost:7702
+```
+
+### 2.2 Golden Box 策略（核心性能优化）
+
+**为什么需要 golden box：**
+每次 `vagrant up` 从头 provision（装 Claude Code）需要 3–5 分钟。
+Golden box 把这步变成一次性工作，之后每次启动只需 5–15 秒。
+
+**构建流程：**
+```
+Ubuntu 24.04 cloud image (generic/ubuntu2404 libvirt box)
+    ↓ vagrant up + provision（一次性，约 5 分钟）
+    装：git, python3, nodejs, go, ttyd, claude, 开发工具
+    ↓ vagrant package --output claude-worker.box
+    ↓ vagrant box add claude-worker ./claude-worker.box
+claude-worker.box（本地 golden box）
+    ↓ 每次 worker start（无 provision）
+    5–15 秒内就绪
+```
+
+**命令：**
+```bash
+claude-code-worker build-box          # 构建/重建 golden box（约 5 分钟，只需偶尔执行）
+claude-code-worker build-box --force  # 强制重建（更新 Claude Code 版本时用）
+```
+
+### 2.3 前置依赖
+
+```bash
+# 宿主机需要安装
+sudo apt install qemu-kvm libvirt-daemon-system vagrant
+vagrant plugin install vagrant-libvirt
+
+# 确认 KVM 可用
+kvm-ok
+virsh list --all
+```
+
+### 2.4 文件结构
+
+```
+.claude-worker/
+├── SPEC.md
+├── claude-code-worker          # 宿主机 CLI（Python）
+├── install.sh                  # 一键安装脚本
+├── build-box/
+│   ├── Vagrantfile             # Golden box 构建用
+│   └── provision.sh            # 工具安装脚本（apt + claude + ttyd）
+└── vm/
+    ├── Vagrantfile.tmpl        # Worker VM 模板（动态生成）
+    ├── entrypoint.sh           # VM 内初始化脚本
+    └── push-and-exit.sh        # VM 内自动 commit + push
+```
+
+### 2.5 build-box/Vagrantfile
+
+```ruby
+Vagrant.configure("2") do |config|
+  config.vm.box = "generic/ubuntu2404"
+  config.vm.provider :libvirt do |lv|
+    lv.memory = 4096
+    lv.cpus   = 2
+    lv.driver = "kvm"
+  end
+
+  config.vm.provision "shell", path: "provision.sh"
+end
+```
+
+### 2.6 build-box/provision.sh
+
+> ⚠️ 路径说明：Vagrant 的 synced_folder 默认只挂载 `build-box/` 目录为 `/vagrant`，
+> 无法直接访问 `vm/` 下的脚本。解法：`build-box/Vagrantfile` 额外 sync `vm/` 目录，
+> 或在 provision.sh 里用 curl/wget 从本地 HTTP 服务获取，或在打包前手动复制。
+> 最简方案：在 `build-box/Vagrantfile` 中添加 `config.vm.synced_folder "../vm", "/vm-scripts"`。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+export DISABLE_AUTOUPDATER=1
+
+apt-get update && apt-get install -y --no-install-recommends \
+    curl wget ca-certificates gnupg2 \
+    git git-lfs \
+    build-essential make cmake \
+    python3 python3-pip python3-venv \
+    nodejs npm \
+    ttyd \
+    vim less jq tmux \
+    && rm -rf /var/lib/apt/lists/*
+
+# Claude Code（native installer）
+curl -fsSL https://claude.ai/install.sh | bash
+
+# 确保 claude 在全局 PATH
+CLAUDE_BIN=$(find /root/.local/bin /opt/claude-code/bin -name claude 2>/dev/null | head -1)
+ln -sf "$CLAUDE_BIN" /usr/local/bin/claude
+
+# 验证安装
+claude --version
+
+# 写入 entrypoint 和 push 脚本（由 build-box/Vagrantfile sync /vm-scripts 挂载）
+cp /vm-scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+cp /vm-scripts/push-and-exit.sh /usr/local/bin/push-and-exit.sh
+chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/push-and-exit.sh
+
+echo "[provision] Golden box 构建完成"
+```
+
+### 2.7 vm/Vagrantfile.tmpl
+
+每个 worker 动态生成，`{{占位符}}` 由 CLI 替换：
+
+```ruby
+Vagrant.configure("2") do |config|
+  config.vm.box = "claude-worker"   # 使用本地 golden box
+
+  config.vm.network "forwarded_port",
+    guest: 7681,
+    host:  {{HOST_PORT}},
+    host_ip: "127.0.0.1"            # 只绑定 localhost，不对外暴露
+
+  config.vm.provider :libvirt do |lv|
+    lv.memory = {{MEMORY_MB}}
+    lv.cpus   = {{CPUS}}
+    lv.driver = "kvm"
+  end
+
+  # SSH key 只读挂载（用于 git push）
+  config.vm.synced_folder "~/.ssh", "/root/.ssh",
+    type: "rsync",
+    rsync__exclude: [],
+    rsync__args: ["--chmod=D700,F600"]
+
+  # 注入环境变量并启动 ttyd + claude
+  config.vm.provision "shell", run: "always", env: {
+    "ANTHROPIC_API_KEY" => ENV["ANTHROPIC_API_KEY"] || "",
+    "GIT_TOKEN"         => ENV["GIT_TOKEN"] || "",
+    "WORKER_ID"         => "{{WORKER_ID}}",
+    "WORKER_REPO_URL"   => "{{REPO_URL}}",
+    "WORKER_BRANCH"     => "{{BRANCH}}",
+    "WORKER_PURPOSE"    => "{{PURPOSE}}",
+  }, inline: "/usr/local/bin/entrypoint.sh"
+end
+```
+
+> **安全说明**：`ENV["ANTHROPIC_API_KEY"]` 在 CLI 执行时从宿主机 `secrets.env` 读取并注入，
+> 不写入 Vagrantfile 文件本身（Vagrantfile 是动态生成的临时文件，存于 `~/.claude-worker/instances/` 下）。
+
+### 2.8 vm/entrypoint.sh
+
+API Key 三层获取逻辑（优先级：URL > 挂载文件 > 环境变量）：
+- URL 方式：key 只进内存，不落磁盘，最安全
+- 文件挂载：key 通过 rsync 进 VM，存在磁盘，需权限保护
+- 环境变量：兜底，通过 Vagrant `env:` 注入
+
+> ⚠️ 注意：`/etc/environment` 会落磁盘，仅在无更好方案时作为兜底使用。
+> VM 销毁后磁盘随之销毁，风险可控；但在 VM 存活期间 key 可被读取。
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${WORKER_REPO_URL:?需要 WORKER_REPO_URL}"
+: "${WORKER_BRANCH:?需要 WORKER_BRANCH}"
+: "${WORKER_PURPOSE:?需要 WORKER_PURPOSE}"
+: "${WORKER_ID:?需要 WORKER_ID}"
+
+# ── API Key 三层获取（优先级：URL > 挂载文件 > 环境变量）──────
+if [[ -n "${SECRET_URL:-}" ]]; then
+    # 层 1：从 URL 动态获取，key 只进内存
+    ANTHROPIC_API_KEY=$(curl -sf "$SECRET_URL" \
+        -H "Authorization: Bearer ${SECRET_TOKEN:-}" \
+        | grep -o '"api_key":"[^"]*"' | cut -d'"' -f4)
+elif [[ -f "/secrets/anthropic_api_key" ]]; then
+    # 层 2：从挂载文件读取
+    ANTHROPIC_API_KEY=$(cat /secrets/anthropic_api_key)
+else
+    # 层 3：从环境变量（Vagrant env: 注入）
+    : "${ANTHROPIC_API_KEY:?未配置 API Key（需 SECRET_URL、/secrets/anthropic_api_key 或 ANTHROPIC_API_KEY 之一）}"
+fi
+export ANTHROPIC_API_KEY
+
+# 写入全局环境（使 ttyd 启动的子进程也能读取）
+# 仅在环境变量兜底路径下 key 会落磁盘；URL/文件路径 key 只在此进程内存中
+echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> /etc/environment
+
+RESULT_BRANCH="result/${WORKER_PURPOSE}-$(date +%Y%m%d-%H%M%S)"
+TTYD_PORT="${TTYD_PORT:-7681}"
+
+# Git 凭证（HTTPS token 方式）
+if [[ -n "${GIT_TOKEN:-}" ]]; then
+    GIT_HOST=$(echo "$WORKER_REPO_URL" | sed -E 's|https?://([^/]+)/.*|\1|')
+    printf "machine %s\n  login x-access-token\n  password %s\n" \
+        "$GIT_HOST" "$GIT_TOKEN" > /root/.netrc
+    chmod 600 /root/.netrc
+fi
+# SSH 方式：rsync 挂载的 ~/.ssh 已经就位
+
+# 克隆并切换分支
+git clone --depth=50 --branch "$WORKER_BRANCH" "$WORKER_REPO_URL" /workspace
+cd /workspace
+git checkout -b "$RESULT_BRANCH"
+echo "$RESULT_BRANCH" > /tmp/result_branch_name
+git config user.email "claude-worker@local"
+git config user.name "Claude Worker ($WORKER_PURPOSE)"
+
+# 写入任务上下文
+cat > /workspace/CLAUDE.md << EOF
+# Worker 上下文
+- **任务**: $WORKER_PURPOSE
+- **源分支**: $WORKER_BRANCH
+- **结果分支**: $RESULT_BRANCH
+- **Worker ID**: $WORKER_ID
+
+完成后关闭浏览器标签，系统会自动 commit + push。
+EOF
+
+echo "[worker] 启动 ttyd :$TTYD_PORT，结果分支: $RESULT_BRANCH"
+
+TTYD_ARGS=(--port "$TTYD_PORT" --writable --once --ping-interval 30)
+[[ -n "${TTYD_CREDENTIAL:-}" ]] && TTYD_ARGS+=(--credential "$TTYD_CREDENTIAL")
+
+ttyd "${TTYD_ARGS[@]}" \
+    bash -c "cd /workspace && exec claude --dangerously-skip-permissions"
+
+# ttyd 退出后自动 push
+exec /usr/local/bin/push-and-exit.sh
+```
+
+### 2.9 vm/push-and-exit.sh
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /workspace 2>/dev/null || { echo "[push] 无 /workspace，跳过"; exit 0; }
+
+RESULT_BRANCH=$(cat /tmp/result_branch_name 2>/dev/null \
+    || git rev-parse --abbrev-ref HEAD)
+
+echo "[push] 会话结束，推送: $RESULT_BRANCH"
+
+if git status --porcelain | grep -q .; then
+    git add -A
+    git commit -m "chore: auto-commit by claude-worker
+
+Worker: ${WORKER_ID:-unknown}
+Purpose: ${WORKER_PURPOSE:-unknown}
+Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+fi
+
+if git push origin "$RESULT_BRANCH"; then
+    echo "[push] 成功: $RESULT_BRANCH"
+    echo "pushed:$RESULT_BRANCH" > /tmp/push_status
+else
+    echo "[push] 失败！"
+    echo "failed" > /tmp/push_status
+    # 备份到宿主机共享目录（如有）
+    [[ -d /vagrant-backup ]] && \
+        tar czf /vagrant-backup/workspace-backup-$(date +%s).tar.gz /workspace
+    exit 1
+fi
+```
+
+### 2.10 claude-code-worker CLI 接口
+
+```
+用法:
+  claude-code-worker start --repo <url> --branch <branch> --purpose <purpose> [选项]
+  claude-code-worker list
+  claude-code-worker stop <id> [--force]
+  claude-code-worker logs <id>
+  claude-code-worker status <id>
+  claude-code-worker review --repo <url> --branch <result-branch> [--purpose review]
+  claude-code-worker build-box [--force]
+
+# 兼容简写:
+  claude-code-worker --repo <url> --branch <branch> --purpose <purpose>
+
+start 选项:
+  --ttyd-password  ttyd Basic Auth 密码
+  --memory         VM 内存（默认 2048，单位 MB）
+  --cpus           VM CPU 数（默认 2）
+  --no-ssh         不同步 ~/.ssh 进 VM
+  --secret-url     API Key 获取 URL（层 1）
+  --secret-token   SECRET_URL 的 Bearer Token
+
+review 说明:
+  起一个新 worker VM，检出 <result-branch>，claude 阅读变更并生成 review。
+  review 结果存放位置待定（见 2.16 待设计事项）。
+  worker 完成后自动销毁。
+```
+
+### 2.11 配置文件
+
+**`~/.claude-worker/secrets.env`**（chmod 600，不进 git）：
+```bash
+ANTHROPIC_API_KEY=sk-ant-api03-xxxx
+# GIT_TOKEN=ghp_xxxx   # HTTPS push 时使用
+```
+
+CLI 启动时读取此文件并导出为进程环境变量，通过 Vagrantfile `env:` 注入 VM。
+Ruby 读取的是进程环境（`ENV["KEY"]`），需要 CLI 在调用 `vagrant` 前先 `export`。
+
+### 2.12 端口规划
+
+| 范围 | 绑定 | 说明 |
+|---|---|---|
+| 7700–7799 | 127.0.0.1 | worker ttyd 端口，最多 100 个并行 |
+
+### 2.13 安全模型
+
+| 风险 | 缓解措施 |
+|---|---|
+| API Key 泄露 | `secrets.env` chmod 600，通过 Vagrant `env:` 注入（不写入文件） |
+| VM 逃逸 | KVM 硬件隔离，不共享内核 |
+| 端口暴露 | 全部绑定 `127.0.0.1` |
+| 代码丢失 | push 失败时备份到宿主机共享目录 |
+| 资源失控 | libvirt memory/cpus 限制 |
+
+### 2.14 完整使用流程
+
+```bash
+# === 首次安装（只需一次）===
+cd .claude-worker && chmod +x install.sh && ./install.sh
+# 安装 vagrant-libvirt plugin，注册脚本到 PATH
+
+vim ~/.claude-worker/secrets.env   # 填入 ANTHROPIC_API_KEY
+
+claude-code-worker build-box       # 构建 golden box（约 5 分钟）
+
+# === 日常使用 ===
+claude-code-worker --repo git@github.com:org/repo.git \
+                   --branch release/4.0.0 \
+                   --purpose bug-fixing
+# → [info] 启动 VM ccw-bug-fixing-20240403120000...
+# → [ready] 打开 http://localhost:7700
+
+# 并行第二个
+claude-code-worker --repo git@github.com:org/repo.git \
+                   --branch main \
+                   --purpose feature-login
+# → [ready] 打开 http://localhost:7701
+
+claude-code-worker list
+# WORKER ID                          PORT   BRANCH          PURPOSE
+# ccw-bug-fixing-20240403120000      7700   release/4.0.0   bug-fixing
+# ccw-feature-login-20240403120100   7701   main            feature-login
+
+claude-code-worker stop ccw-bug-fixing-20240403120000
+# → [info] 触发 push...
+# → [push] 成功: result/bug-fixing-20240403-120001
+# → [info] VM 已销毁
+```
+
+### 2.15 待确认事项（本地机器实测）
+
+- [ ] `claude --dangerously-skip-permissions` 在 VM 内首次运行是否还需要交互确认？
+      → 若需要，在 provision.sh 中预先运行一次 `echo "" | claude --print "hello"` 完成初始化
+- [ ] `ttyd --once` 在连接断开后是否立即退出进程？
+      → 若不立即退出，改用 `ttyd --once --exit-on-disconnect`（如支持）或用 trap 处理
+- [ ] golden box 中 claude 安装路径：`/root/.local/bin/` 还是 `/opt/claude-code/bin/`？
+      → provision.sh 用 `find` 自动定位并建 symlink，已处理
+- [ ] SSH rsync 到 VM 时权限是否正确？
+      → 已在 Vagrantfile 中指定 `--chmod=D700,F600`，实测确认
+
+### 2.16 待设计事项（需用户决策后补充）
+
+#### Worker 产物（VM 销毁前保存）
+worker push 前需生成并提交以下产物，具体内容待定：
+- 代码变更（已有）
+- spec/plan 文档
+- 初步 AI 自我 review 文档
+- 行为测试文档
+- 测试运行结果
+
+**待定问题**：
+- [ ] 产物存放位置：repo 内 `.worker-output/` 目录 vs PR description/comments？
+- [ ] 测试命令如何获取：从 Makefile/package.json 自动推断 vs 启动时 `--test-cmd` 指定？
+
+#### 审核流程
+- 支持人工和 AI 审核，按事项决定
+- `claude-code-worker review --branch result/xxx` 起新 worker 做 AI review
+- VM push 完立即销毁，VM 和 PR 生命周期解耦
+
+**待定问题**：
+- [ ] review worker 的产物如何回写：PR comment vs 新 commit vs 单独文件？
+- [ ] AI review 是否自动触发（push 后立即起 review worker）还是手动调用？
+- [ ] PR 是 worker 自动创建还是人工创建？
+
+#### API Key 获取方式（三选一，优先级顺序）
+1. 请求 URL（动态，不落磁盘）—— `SECRET_URL` + `SECRET_TOKEN`
+2. 挂载目录文件读取 —— `/secrets/anthropic_api_key`
+3. 环境变量兜底 —— `ANTHROPIC_API_KEY`
+
+**待定问题**：
+- [ ] 用户的 secret server 方案（自建 vs Vault vs 云服务）？
+
+#### Box 更新策略
+采用**方向 A：简单重建**。
+流程：停所有 worker → `claude-code-worker build-box --force` 重建 → 继续使用新 box。
+无版本共存，旧 box 直接替换。适合个人开发工具、worker 生命周期短的场景。
+
+#### install.sh（一次性环境准备）
+用途：让本地机器具备运行 `claude-code-worker` 的条件（类比"装 Docker Engine"）。
+执行顺序：`install.sh` → `build-box` → 日常 `start`。
+
+需要完成：
+1. 检查 KVM 可用性（`kvm-ok`）、libvirt daemon 状态、用户是否在 `libvirt` 组
+2. 安装 `vagrant-libvirt` plugin 及其系统依赖（`libvirt-dev`、`ruby-dev`）
+3. 下载 base box（`vagrant box add generic/ubuntu2404`，几百 MB）
+4. 初始化 `~/.claude-worker/` 目录结构和 `secrets.env` 模板
+5. 将 `claude-code-worker` symlink 到 `/usr/local/bin/`
+
+**待定问题**：
+- [ ] 是否需要 install.sh，还是用户手动处理依赖即可？
+
+---
+
+## 3. 方案 B（演进）：Weaveworks Ignite — Firecracker 封装
+
+> 📋 规划阶段，暂不实现。当方案 A 满足不了启动速度需求时迁移。
+
+**核心优势**：启动时间 ~1 秒，接近 Anthropic 云端体验。
+
+**原理**：
+```
+ignite run ubuntu  →  Firecracker VMM  →  KVM  →  microVM（125ms 启动）
+```
+Ignite 提供类 Docker 的 CLI，但底层每个"容器"是一个真正的 VM。
+
+**前置依赖**：
+```bash
+# 需要 KVM（已有），额外安装：
+curl -fsSL https://github.com/weaveworks/ignite/releases/latest/download/ignite-amd64 \
+    -o /usr/local/bin/ignite && chmod +x /usr/local/bin/ignite
+
+# containerd（Ignite 依赖）
+sudo apt install containerd
+```
+
+**与方案 A 的差异**：
+- 启动命令：`ignite run claude-worker:latest --name ccw-xxx --ports 7700:7681`（替换 `vagrant up`）
+- 停止命令：`ignite stop ccw-xxx && ignite rm ccw-xxx`（替换 `vagrant destroy`）
+- Golden image：用 `ignite build` 替换 `vagrant package`
+- `entrypoint.sh`、`push-and-exit.sh`、CLI 接口**完全不变**
+
+**迁移成本**：仅替换 `claude-code-worker` CLI 中的 ~50 行启动/停止逻辑。
+
+---
+
+## 4. 方案 C（演进）：Kata Containers — Docker CLI + VM 隔离
+
+> 📋 规划阶段，暂不实现。适合团队共享 CI/CD 场景。
+
+**核心优势**：对外呈现标准 Docker 接口，底层每个容器是 KVM microVM，1–2 秒启动。
+
+**原理**：
+```
+docker run  →  containerd  →  Kata shim  →  QEMU/Firecracker  →  KVM  →  microVM
+```
+
+**前置依赖**：
+```bash
+sudo apt install kata-containers
+# 配置 Docker/containerd 使用 kata runtime
+```
+
+**与方案 A 的差异**：
+- 启动命令：`docker run --runtime=kata-runtime ...`（回归 Docker 接口）
+- 构建：`docker build`（替换 `vagrant package`）
+- `entrypoint.sh`、`push-and-exit.sh`、CLI 接口**完全不变**
+
+**适用场景**：多人团队、有 Docker Registry、需要 CI/CD 集成时优先选择。
+
+---
+
+## 5. 三方案对比
+
+| | 方案 A（当前）| 方案 B（演进）| 方案 C（演进）|
+|---|---|---|---|
+| **技术** | Vagrant + libvirt | Weaveworks Ignite | Kata Containers |
+| **CLI** | vagrant | ignite | docker |
+| **启动时间** | 5–15 秒 | ~1 秒 | 1–2 秒 |
+| **隔离** | KVM VM | Firecracker VM | QEMU/Firecracker VM |
+| **前置依赖** | KVM + Vagrant（已有） | KVM + containerd | Docker + KVM |
+| **镜像格式** | .box | OCI image | Docker image |
+| **Docker Registry** | 不需要 | 不需要 | 可选 |
+| **团队共享** | 困难（.box 文件大） | 中等 | 容易（Registry） |
+| **迁移成本** | — | 低（替换 ~50 行） | 低（替换 ~50 行） |
+
+---
+
+## 6. 会话持久化技术路径（待确认）
+
+> 📋 本节记录对 Anthropic Claude Code Web 会话持久化机制的技术分析，
+> 作为后续为 claude-code-worker 实现会话持久化的参考路径。
+> 结论来自对当前运行环境的实测推断，未经 Anthropic 官方确认。
+
+### 6.1 已知线索（实测）
+
+```
+PID 1:      /process_api --firecracker-init  （VM 内部，替代 systemd）
+Git remote: http://local_proxy@127.0.0.1:43563/git/ekeyme/python-appimage-ots
+~/.claude/
+├── sessions/    ← 本地会话元数据（session ID 等）
+├── projects/    ← 项目数据
+└── settings.json
+```
+
+### 6.2 整体架构
+
+```
+宿主机（Anthropic 物理服务器）
+│
+├── Firecracker VMM 进程（宿主机上）
+│   - 分配内存、CPU
+│   - 加载 VM 内核镜像 + rootfs 镜像
+│   - 配置 virtio 网络/磁盘设备
+│   └── ↓ 内核启动后控制权交给 VM 内部
+│
+└── Firecracker VM 内部
+    ├── Linux 内核（6.18.5）
+    └── PID 1: /process_api --firecracker-init
+            ├── 从对象存储拉取 ~/.claude/ 到 VM 磁盘
+            ├── 挂载 git 工作目录（通过本地 git proxy）
+            ├── 启动 git proxy（127.0.0.1:43563）
+            └── 启动 claude 进程
+```
+
+### 6.3 会话数据的分层存储
+
+```
+┌─────────────────────────────────────────────┐
+│             Anthropic 数据中心               │
+│                                             │
+│  ┌──────────────────┐  ┌─────────────────┐  │
+│  │    对话数据库     │  │   用户文件存储   │  │
+│  │  (PostgreSQL /   │  │   (S3-like      │  │
+│  │   DynamoDB 等)   │  │    对象存储)     │  │
+│  │                  │  │                 │  │
+│  │  session_id  →   │  │  user_id →      │  │
+│  │  messages[]      │  │  ~/.claude/     │  │
+│  └──────────────────┘  └─────────────────┘  │
+└─────────────────────────────────────────────┘
+          ↑ 实时写入（每条消息）    ↑ sync
+          │                        │
+┌─────────────────────────────────────────────┐
+│             Firecracker VM                  │
+│                                             │
+│  process_api 启动时：                        │
+│  → 从对象存储 sync ~/.claude/ 到 VM 磁盘     │
+│                                             │
+│  claude 进程运行中：                          │
+│  → 每条消息实时写入对话数据库（流式）           │
+│  → ~/.claude/ 变更定期 sync 回对象存储        │
+│                                             │
+│  VM 销毁时：                                 │
+│  → ~/.claude/ 最终 sync 回对象存储           │
+└─────────────────────────────────────────────┘
+```
+
+### 6.4 文件持久化机制推断
+
+**工作目录（代码文件）**：通过 git 持久化
+```
+VM 内 /home/user/<project>/
+    ↕  git push / git pull
+GitHub 仓库（通过 127.0.0.1:43563 代理）
+```
+未 push 的本地改动在 VM 销毁后丢失。
+
+**`~/.claude/` 目录**：通过对象存储持久化
+```
+VM 启动  → 对象存储 sync 到 VM 磁盘
+运行中   → 定期/增量 sync 回对象存储
+VM 销毁  → 最终 sync 确保不丢数据
+```
+
+**对话消息内容**：实时写入数据库，与 VM 生命周期完全解耦
+```
+用户发消息 → 立即写入 Anthropic 数据库
+AI 回复    → token 边生成边写入
+VM 崩溃    → 已发送的消息不丢失
+```
+
+### 6.5 process_api 的角色
+
+`process_api` 是 Anthropic 自定义的 PID 1（替代 systemd），bake 进 rootfs 镜像。
+
+| 传统 VM | Anthropic Firecracker VM |
+|---|---|
+| PID 1: systemd | PID 1: /process_api |
+| 启动所有系统服务 | 只做用户数据挂载 + claude 启动 |
+| 启动慢（秒级） | 极轻量，配合 Firecracker 实现 125ms 启动 |
+| 通用 | 完全为 Claude Code Web 定制 |
+
+### 6.6 对 claude-code-worker 的参考意义
+
+我们的 `entrypoint.sh` 已经是简化版的 `process_api`，可以参考 Anthropic 的做法进一步演进：
+
+| Anthropic 做法 | claude-code-worker 当前 | 可演进方向 |
+|---|---|---|
+| 对象存储 sync ~/.claude/ | ❌ 未实现 | MinIO 或 NFS 挂载 ~/.claude/ |
+| 对话数据库实时写入 | ❌ 未实现 | SQLite 本地存储 + 定期备份 |
+| git proxy（本地代理） | 直接 git clone | 可选：本地 git mirror 加速 |
+| 工作目录持久化 | git push 到 result 分支 | ✅ 已覆盖 |
+| VM 销毁前 sync | push-and-exit.sh | ✅ 已覆盖（代码层面） |
+
+**优先级建议**：对于个人开发工具，`~/.claude/` 持久化（保留 claude 本地配置和会话元数据）收益最大，可用 rsync 到宿主机目录实现，成本极低。
