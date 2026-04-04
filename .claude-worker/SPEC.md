@@ -1,6 +1,6 @@
 # Claude Code Worker — 设计规格（Design Spec）
 
-**版本**: 0.5  
+**版本**: 0.6  
 **当前实现方案**: 方案 A — Vagrant + libvirt + Ubuntu Cloud Image  
 **目标**: 让用户通过一条命令启动多个隔离的 Claude Code 工作环境，每个环境对应一个 git 分支，在浏览器中与 Claude Code 交互完成任务，结果自动推送到结果分支。
 
@@ -575,3 +575,123 @@ sudo apt install kata-containers
 | **Docker Registry** | 不需要 | 不需要 | 可选 |
 | **团队共享** | 困难（.box 文件大） | 中等 | 容易（Registry） |
 | **迁移成本** | — | 低（替换 ~50 行） | 低（替换 ~50 行） |
+
+---
+
+## 6. 会话持久化技术路径（待确认）
+
+> 📋 本节记录对 Anthropic Claude Code Web 会话持久化机制的技术分析，
+> 作为后续为 claude-code-worker 实现会话持久化的参考路径。
+> 结论来自对当前运行环境的实测推断，未经 Anthropic 官方确认。
+
+### 6.1 已知线索（实测）
+
+```
+PID 1:      /process_api --firecracker-init  （VM 内部，替代 systemd）
+Git remote: http://local_proxy@127.0.0.1:43563/git/ekeyme/python-appimage-ots
+~/.claude/
+├── sessions/    ← 本地会话元数据（session ID 等）
+├── projects/    ← 项目数据
+└── settings.json
+```
+
+### 6.2 整体架构
+
+```
+宿主机（Anthropic 物理服务器）
+│
+├── Firecracker VMM 进程（宿主机上）
+│   - 分配内存、CPU
+│   - 加载 VM 内核镜像 + rootfs 镜像
+│   - 配置 virtio 网络/磁盘设备
+│   └── ↓ 内核启动后控制权交给 VM 内部
+│
+└── Firecracker VM 内部
+    ├── Linux 内核（6.18.5）
+    └── PID 1: /process_api --firecracker-init
+            ├── 从对象存储拉取 ~/.claude/ 到 VM 磁盘
+            ├── 挂载 git 工作目录（通过本地 git proxy）
+            ├── 启动 git proxy（127.0.0.1:43563）
+            └── 启动 claude 进程
+```
+
+### 6.3 会话数据的分层存储
+
+```
+┌─────────────────────────────────────────────┐
+│             Anthropic 数据中心               │
+│                                             │
+│  ┌──────────────────┐  ┌─────────────────┐  │
+│  │    对话数据库     │  │   用户文件存储   │  │
+│  │  (PostgreSQL /   │  │   (S3-like      │  │
+│  │   DynamoDB 等)   │  │    对象存储)     │  │
+│  │                  │  │                 │  │
+│  │  session_id  →   │  │  user_id →      │  │
+│  │  messages[]      │  │  ~/.claude/     │  │
+│  └──────────────────┘  └─────────────────┘  │
+└─────────────────────────────────────────────┘
+          ↑ 实时写入（每条消息）    ↑ sync
+          │                        │
+┌─────────────────────────────────────────────┐
+│             Firecracker VM                  │
+│                                             │
+│  process_api 启动时：                        │
+│  → 从对象存储 sync ~/.claude/ 到 VM 磁盘     │
+│                                             │
+│  claude 进程运行中：                          │
+│  → 每条消息实时写入对话数据库（流式）           │
+│  → ~/.claude/ 变更定期 sync 回对象存储        │
+│                                             │
+│  VM 销毁时：                                 │
+│  → ~/.claude/ 最终 sync 回对象存储           │
+└─────────────────────────────────────────────┘
+```
+
+### 6.4 文件持久化机制推断
+
+**工作目录（代码文件）**：通过 git 持久化
+```
+VM 内 /home/user/<project>/
+    ↕  git push / git pull
+GitHub 仓库（通过 127.0.0.1:43563 代理）
+```
+未 push 的本地改动在 VM 销毁后丢失。
+
+**`~/.claude/` 目录**：通过对象存储持久化
+```
+VM 启动  → 对象存储 sync 到 VM 磁盘
+运行中   → 定期/增量 sync 回对象存储
+VM 销毁  → 最终 sync 确保不丢数据
+```
+
+**对话消息内容**：实时写入数据库，与 VM 生命周期完全解耦
+```
+用户发消息 → 立即写入 Anthropic 数据库
+AI 回复    → token 边生成边写入
+VM 崩溃    → 已发送的消息不丢失
+```
+
+### 6.5 process_api 的角色
+
+`process_api` 是 Anthropic 自定义的 PID 1（替代 systemd），bake 进 rootfs 镜像。
+
+| 传统 VM | Anthropic Firecracker VM |
+|---|---|
+| PID 1: systemd | PID 1: /process_api |
+| 启动所有系统服务 | 只做用户数据挂载 + claude 启动 |
+| 启动慢（秒级） | 极轻量，配合 Firecracker 实现 125ms 启动 |
+| 通用 | 完全为 Claude Code Web 定制 |
+
+### 6.6 对 claude-code-worker 的参考意义
+
+我们的 `entrypoint.sh` 已经是简化版的 `process_api`，可以参考 Anthropic 的做法进一步演进：
+
+| Anthropic 做法 | claude-code-worker 当前 | 可演进方向 |
+|---|---|---|
+| 对象存储 sync ~/.claude/ | ❌ 未实现 | MinIO 或 NFS 挂载 ~/.claude/ |
+| 对话数据库实时写入 | ❌ 未实现 | SQLite 本地存储 + 定期备份 |
+| git proxy（本地代理） | 直接 git clone | 可选：本地 git mirror 加速 |
+| 工作目录持久化 | git push 到 result 分支 | ✅ 已覆盖 |
+| VM 销毁前 sync | push-and-exit.sh | ✅ 已覆盖（代码层面） |
+
+**优先级建议**：对于个人开发工具，`~/.claude/` 持久化（保留 claude 本地配置和会话元数据）收益最大，可用 rsync 到宿主机目录实现，成本极低。
